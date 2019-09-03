@@ -64,6 +64,7 @@ type SSServer struct {
 }
 
 func (s *SSServer) startPort(portNum int) error {
+	timeout := 59 * time.Second
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{Port: portNum})
 	if err != nil {
 		return fmt.Errorf("Failed to start TCP on port %v: %v", portNum, err)
@@ -75,7 +76,7 @@ func (s *SSServer) startPort(portNum int) error {
 	logger.Infof("Listening TCP and UDP on port %v", portNum)
 	port := &SSPort{cipherList: shadowsocks.NewCipherList()}
 	// TODO: Register initial data metrics at zero.
-	port.tcpService = shadowsocks.NewTCPService(listener, &port.cipherList, s.m)
+	port.tcpService = shadowsocks.NewTCPService(listener, &port.cipherList, s.m, timeout)
 	port.udpService = shadowsocks.NewUDPService(packetConn, s.natTimeout, &port.cipherList, s.m)
 	s.ports[portNum] = port
 	go port.udpService.Start()

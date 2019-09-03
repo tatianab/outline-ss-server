@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"time"
 
@@ -29,21 +30,21 @@ import (
 )
 
 // Reads bytes from reader and appends to buf to ensure the needed number of bytes.
-// The cpacity of buf must be at least bytesNeeded.
-func ensureBytes(reader io.Reader, buf []byte, bytesNeeded int) ([]byte, error) {
+// The capacity of buf must be at least bytesNeeded.
+func ensureBytes(reader io.Reader, buf []byte, bytesNeeded int) ([]byte, int, error) {
 	if cap(buf) < bytesNeeded {
-		return buf, io.ErrShortBuffer
+		return buf, 0, io.ErrShortBuffer
 	}
 	bytesToRead := bytesNeeded - len(buf)
 	if bytesToRead <= 0 {
-		return buf, nil
+		return buf, 0, nil
 	}
 	n, err := io.ReadFull(reader, buf[len(buf):bytesNeeded])
 	buf = buf[:len(buf)+n]
 	if (err == nil || err == io.EOF) && n < bytesToRead {
 		err = io.ErrUnexpectedEOF
 	}
-	return buf, err
+	return buf, n, err
 }
 
 func remoteIP(conn net.Conn) net.IP {
@@ -61,7 +62,7 @@ func remoteIP(conn net.Conn) net.IP {
 	return nil
 }
 
-func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, onet.DuplexConn, error) {
+func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, onet.DuplexConn, int, error) {
 	// This must have enough space to hold the salt + 2 bytes chunk length + AEAD tag (Oeverhead) for any cipher
 	replayBytes := make([]byte, 0, 32+2+16)
 	// Constant of zeroes to use as the start chunk count. This must be as big as the max NonceSize() across all ciphers.
@@ -69,6 +70,7 @@ func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, o
 	// To hold the decrypted chunk length.
 	chunkLenBuf := [2]byte{}
 	var err error
+	var maxBytesRead, bytesRead1, bytesRead2 int
 
 	clientIP := remoteIP(clientConn)
 	// Try each cipher until we find one that authenticates successfully. This assumes that all ciphers are AEAD.
@@ -76,7 +78,7 @@ func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, o
 	// TODO: Ban and log client IPs with too many failures too quick to protect against DoS.
 	for ci, entry := range cipherList.SafeSnapshotForClientIP(clientIP) {
 		id, cipher := entry.Value.(*CipherEntry).ID, entry.Value.(*CipherEntry).Cipher
-		replayBytes, err = ensureBytes(clientConn, replayBytes, cipher.SaltSize())
+		replayBytes, bytesRead1, err = ensureBytes(clientConn, replayBytes, cipher.SaltSize())
 		if err != nil {
 			if logger.IsEnabledFor(logging.DEBUG) {
 				logger.Debugf("TCP: Failed to read salt %v: %v", id, err)
@@ -85,7 +87,10 @@ func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, o
 		}
 		salt := replayBytes[:cipher.SaltSize()]
 		aead, err := cipher.Decrypter(salt)
-		replayBytes, err = ensureBytes(clientConn, replayBytes, cipher.SaltSize()+2+aead.Overhead())
+		replayBytes, bytesRead2, err = ensureBytes(clientConn, replayBytes, cipher.SaltSize()+2+aead.Overhead())
+		if bytesRead := bytesRead1 + bytesRead2; bytesRead > maxBytesRead {
+			maxBytesRead = bytesRead
+		}
 		if err != nil {
 			if logger.IsEnabledFor(logging.DEBUG) {
 				logger.Debugf("TCP: Failed to read length %v: %v", id, err)
@@ -107,21 +112,22 @@ func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, o
 		cipherList.SafeMarkUsedByClientIP(entry, clientIP)
 		ssr := NewShadowsocksReader(io.MultiReader(bytes.NewReader(replayBytes), clientConn), cipher)
 		ssw := NewShadowsocksWriter(clientConn, cipher)
-		return id, onet.WrapConn(clientConn, ssr, ssw).(onet.DuplexConn), nil
+		return id, onet.WrapConn(clientConn, ssr, ssw).(onet.DuplexConn), maxBytesRead, nil
 	}
-	return "", nil, fmt.Errorf("Could not find valid TCP cipher")
+	return "", clientConn, maxBytesRead, fmt.Errorf("Could not find valid TCP cipher")
 }
 
 type tcpService struct {
-	listener  *net.TCPListener
-	ciphers   *CipherList
-	m         metrics.ShadowsocksMetrics
-	isRunning bool
+	listener    *net.TCPListener
+	ciphers     *CipherList
+	m           metrics.ShadowsocksMetrics
+	isRunning   bool
+	readTimeout time.Duration
 }
 
 // NewTCPService creates a TCPService
-func NewTCPService(listener *net.TCPListener, ciphers *CipherList, m metrics.ShadowsocksMetrics) TCPService {
-	return &tcpService{listener: listener, ciphers: ciphers, m: m}
+func NewTCPService(listener *net.TCPListener, ciphers *CipherList, m metrics.ShadowsocksMetrics, timeout time.Duration) TCPService {
+	return &tcpService{listener: listener, ciphers: ciphers, m: m, readTimeout: timeout}
 }
 
 // TCPService is a Shadowsocks TCP service that can be started and stopped.
@@ -189,6 +195,7 @@ func (s *tcpService) Start() {
 			}()
 			connStart := time.Now()
 			clientConn.(*net.TCPConn).SetKeepAlive(true)
+			clientConn.SetReadDeadline(connStart.Add(s.readTimeout))
 			keyID := ""
 			var proxyMetrics metrics.ProxyMetrics
 			var timeToCipher time.Duration
@@ -206,11 +213,15 @@ func (s *tcpService) Start() {
 			}()
 
 			findStartTime := time.Now()
-			keyID, clientConn, err := findAccessKey(clientConn, *s.ciphers)
+			keyID, clientConn, numBytes, err := findAccessKey(clientConn, *s.ciphers)
 			timeToCipher = time.Now().Sub(findStartTime)
 
 			if err != nil {
+				logger.Debugf("Failed to find a valid cipher after reading %v bytes: %v", numBytes, err)
+				io.Copy(ioutil.Discard, clientConn) // drain socket
 				return onet.NewConnectionError("ERR_CIPHER", "Failed to find a valid cipher", err)
+			} else {
+				clientConn.SetReadDeadline(time.Time{})
 			}
 
 			return proxyConnection(clientConn, &proxyMetrics)

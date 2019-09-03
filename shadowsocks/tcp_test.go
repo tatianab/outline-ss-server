@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	logging "github.com/op/go-logging"
 	onet "github.com/Jigsaw-Code/outline-ss-server/net"
+	logging "github.com/op/go-logging"
 )
 
 // Simulates receiving invalid TCP connection attempts on a server with 100 ciphers.
@@ -140,7 +140,7 @@ func BenchmarkTCPFindCipherRepeat(b *testing.B) {
 		cipher := cipherEntries[cipherNumber].Cipher
 		go NewShadowsocksWriter(writer, cipher).Write(MakeTestPayload(50))
 		b.StartTimer()
-		_, _, err := findAccessKey(&c, cipherList)
+		_, _, _, err := findAccessKey(&c, cipherList)
 		b.StopTimer()
 		if err != nil {
 			b.Error(err)
