@@ -31,20 +31,20 @@ import (
 
 // Reads bytes from reader and appends to buf to ensure the needed number of bytes.
 // The capacity of buf must be at least bytesNeeded.
-func ensureBytes(reader io.Reader, buf []byte, bytesNeeded int) ([]byte, int, error) {
+func ensureBytes(reader io.Reader, buf []byte, bytesNeeded int) ([]byte, error) {
 	if cap(buf) < bytesNeeded {
-		return buf, 0, io.ErrShortBuffer
+		return buf, io.ErrShortBuffer
 	}
 	bytesToRead := bytesNeeded - len(buf)
 	if bytesToRead <= 0 {
-		return buf, 0, nil
+		return buf, nil
 	}
 	n, err := io.ReadFull(reader, buf[len(buf):bytesNeeded])
 	buf = buf[:len(buf)+n]
 	if (err == nil || err == io.EOF) && n < bytesToRead {
 		err = io.ErrUnexpectedEOF
 	}
-	return buf, n, err
+	return buf, err
 }
 
 func remoteIP(conn net.Conn) net.IP {
@@ -62,7 +62,7 @@ func remoteIP(conn net.Conn) net.IP {
 	return nil
 }
 
-func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, onet.DuplexConn, int, error) {
+func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, onet.DuplexConn, error) {
 	// This must have enough space to hold the salt + 2 bytes chunk length + AEAD tag (Oeverhead) for any cipher
 	replayBytes := make([]byte, 0, 32+2+16)
 	// Constant of zeroes to use as the start chunk count. This must be as big as the max NonceSize() across all ciphers.
@@ -70,7 +70,6 @@ func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, o
 	// To hold the decrypted chunk length.
 	chunkLenBuf := [2]byte{}
 	var err error
-	var maxBytesRead, bytesRead1, bytesRead2 int
 
 	clientIP := remoteIP(clientConn)
 	// Try each cipher until we find one that authenticates successfully. This assumes that all ciphers are AEAD.
@@ -78,7 +77,7 @@ func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, o
 	// TODO: Ban and log client IPs with too many failures too quick to protect against DoS.
 	for ci, entry := range cipherList.SafeSnapshotForClientIP(clientIP) {
 		id, cipher := entry.Value.(*CipherEntry).ID, entry.Value.(*CipherEntry).Cipher
-		replayBytes, bytesRead1, err = ensureBytes(clientConn, replayBytes, cipher.SaltSize())
+		replayBytes, err = ensureBytes(clientConn, replayBytes, cipher.SaltSize())
 		if err != nil {
 			if logger.IsEnabledFor(logging.DEBUG) {
 				logger.Debugf("TCP: Failed to read salt %v: %v", id, err)
@@ -87,10 +86,7 @@ func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, o
 		}
 		salt := replayBytes[:cipher.SaltSize()]
 		aead, err := cipher.Decrypter(salt)
-		replayBytes, bytesRead2, err = ensureBytes(clientConn, replayBytes, cipher.SaltSize()+2+aead.Overhead())
-		if bytesRead := bytesRead1 + bytesRead2; bytesRead > maxBytesRead {
-			maxBytesRead = bytesRead
-		}
+		replayBytes, err = ensureBytes(clientConn, replayBytes, cipher.SaltSize()+2+aead.Overhead())
 		if err != nil {
 			if logger.IsEnabledFor(logging.DEBUG) {
 				logger.Debugf("TCP: Failed to read length %v: %v", id, err)
@@ -112,9 +108,9 @@ func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, o
 		cipherList.SafeMarkUsedByClientIP(entry, clientIP)
 		ssr := NewShadowsocksReader(io.MultiReader(bytes.NewReader(replayBytes), clientConn), cipher)
 		ssw := NewShadowsocksWriter(clientConn, cipher)
-		return id, onet.WrapConn(clientConn, ssr, ssw).(onet.DuplexConn), maxBytesRead, nil
+		return id, onet.WrapConn(clientConn, ssr, ssw).(onet.DuplexConn), nil
 	}
-	return "", clientConn, maxBytesRead, fmt.Errorf("Could not find valid TCP cipher")
+	return "", clientConn, fmt.Errorf("Could not find valid TCP cipher")
 }
 
 type tcpService struct {
@@ -213,17 +209,16 @@ func (s *tcpService) Start() {
 			}()
 
 			findStartTime := time.Now()
-			keyID, clientConn, numBytes, err := findAccessKey(clientConn, *s.ciphers)
+			keyID, clientConn, err := findAccessKey(clientConn, *s.ciphers)
 			timeToCipher = time.Now().Sub(findStartTime)
 
 			if err != nil {
-				logger.Debugf("Failed to find a valid cipher after reading %v bytes: %v", numBytes, err)
+				logger.Debugf("Failed to find a valid cipher after reading %v bytes: %v", proxyMetrics.ClientProxy, err)
 				io.Copy(ioutil.Discard, clientConn) // drain socket
 				return onet.NewConnectionError("ERR_CIPHER", "Failed to find a valid cipher", err)
-			} else {
-				clientConn.SetReadDeadline(time.Time{})
 			}
 
+			clientConn.SetReadDeadline(time.Time{})
 			return proxyConnection(clientConn, &proxyMetrics)
 		}()
 	}
